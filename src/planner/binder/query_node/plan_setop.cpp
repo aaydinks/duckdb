@@ -1,4 +1,5 @@
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -70,13 +71,38 @@ unique_ptr<LogicalOperator> Binder::CastLogicalOperatorToTypes(const vector<Logi
 	}
 }
 
+//! Set operations with set semantics are bound with a DISTINCT modifier on top of the set operation
+//! Check if that modifier deduplicates over all columns of the set operation
+static bool DistinctHandledByModifier(BoundSetOperationNode &node) {
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type != ResultModifierType::DISTINCT_MODIFIER) {
+			continue;
+		}
+		auto &distinct = modifier->Cast<BoundDistinctModifier>();
+		if (distinct.distinct_type != DistinctType::DISTINCT) {
+			continue;
+		}
+		// the modifier must deduplicate over all columns of the set operation
+		if (distinct.target_distincts.size() == node.types.size()) {
+			return true;
+		}
+	}
+	return false;
+}
+
 unique_ptr<LogicalOperator> Binder::CreatePlan(BoundSetOperationNode &node) {
 	// create actual logical ops for setops
 	LogicalOperatorType logical_type = LogicalOperatorType::LOGICAL_INVALID;
+	bool setop_all = node.setop_all;
 	switch (node.setop_type) {
 	case SetOperationType::UNION:
 	case SetOperationType::UNION_BY_NAME:
 		logical_type = LogicalOperatorType::LOGICAL_UNION;
+		// a UNION with a DISTINCT modifier on top is equivalent to a UNION ALL followed by that modifier
+		// use bag semantics for the union itself so that we don't deduplicate twice
+		if (!setop_all && DistinctHandledByModifier(node)) {
+			setop_all = true;
+		}
 		break;
 	case SetOperationType::EXCEPT:
 		logical_type = LogicalOperatorType::LOGICAL_EXCEPT;
@@ -106,7 +132,7 @@ unique_ptr<LogicalOperator> Binder::CreatePlan(BoundSetOperationNode &node) {
 		children.push_back(std::move(child_node));
 	}
 	auto root = make_uniq<LogicalSetOperation>(node.setop_index, node.types.size(), std::move(children), logical_type,
-	                                           node.setop_all);
+	                                           setop_all);
 	return VisitQueryNode(node, std::move(root));
 }
 
