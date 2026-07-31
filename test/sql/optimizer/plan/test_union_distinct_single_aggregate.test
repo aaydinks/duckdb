@@ -1,0 +1,102 @@
+# name: test/sql/optimizer/plan/test_union_distinct_single_aggregate.test
+# description: UNION with set semantics should only deduplicate the result once
+# group: [plan]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TABLE t AS SELECT (i % 10)::BIGINT AS i FROM range(100) r(i);
+
+statement ok
+CREATE TABLE t2 AS SELECT (i % 5)::BIGINT AS i FROM range(50) r(i);
+
+statement ok
+pragma explain_output='physical_only';
+
+# UNION deduplicates using a single hash aggregate
+query II
+EXPLAIN SELECT i FROM t UNION SELECT i FROM t2;
+----
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+
+query II
+EXPLAIN SELECT i FROM t UNION SELECT i FROM t2;
+----
+physical_plan	<!REGEX>:.*HASH_GROUP_BY.*HASH_GROUP_BY.*
+
+# also when one of the children of the UNION is empty
+query II
+EXPLAIN SELECT count(*) FROM (SELECT i FROM t UNION SELECT i FROM t WHERE false) u;
+----
+physical_plan	<!REGEX>:.*HASH_GROUP_BY.*HASH_GROUP_BY.*
+
+# UNION BY NAME
+query II
+EXPLAIN SELECT i FROM t UNION BY NAME SELECT i FROM t2;
+----
+physical_plan	<!REGEX>:.*HASH_GROUP_BY.*HASH_GROUP_BY.*
+
+# UNION ALL does not deduplicate at all
+query II
+EXPLAIN SELECT i FROM t UNION ALL SELECT i FROM t2;
+----
+physical_plan	<!REGEX>:.*HASH_GROUP_BY.*
+
+statement ok
+pragma explain_output='all';
+
+# duplicates are still eliminated
+query I
+SELECT count(*) FROM (SELECT i FROM t UNION SELECT i FROM t WHERE false) u;
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT i FROM t UNION SELECT i FROM t2) u;
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT i FROM t UNION ALL SELECT i FROM t2) u;
+----
+150
+
+query I
+SELECT i FROM t WHERE i > 8 UNION SELECT i FROM t2 WHERE i > 8;
+----
+9
+
+query II
+SELECT i, i + 1 FROM t WHERE i > 8 UNION BY NAME SELECT i FROM t2 WHERE i > 8;
+----
+9	10
+
+query I
+SELECT count(*) FROM (SELECT NULL UNION SELECT NULL) u;
+----
+1
+
+# UNION with modifiers
+query I
+SELECT i FROM t UNION SELECT i FROM t2 ORDER BY i DESC LIMIT 3;
+----
+9
+8
+7
+
+# nested set operations
+query I
+SELECT count(*) FROM (SELECT i FROM t UNION SELECT i FROM t2 UNION SELECT i FROM t) u;
+----
+10
+
+query I
+SELECT count(*) FROM ((SELECT i FROM t UNION SELECT i FROM t2) EXCEPT SELECT i FROM t2) u;
+----
+5
+
+query I
+SELECT count(*) FROM ((SELECT i FROM t UNION SELECT i FROM t2) INTERSECT SELECT i FROM t2) u;
+----
+5
